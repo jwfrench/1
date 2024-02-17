@@ -1,0 +1,398 @@
+---
+title: "Inflation with expectations"
+output: html_document
+date: "2022-12-16"
+runtime: shiny
+---
+
+##  {.tabset}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+#US Inflation plus five and ten year BEI
+#-----------------------libraries-----------------------------------------------
+library(tidyverse)
+library(rdbnomics)
+library(tidyquant)
+library(rlist)
+library(data.table)
+library(plotly)
+library(shiny)
+#-----------------------parameters----------------------------------------------
+
+startDate  = as.Date("1950-01-01") 
+endDate    = Sys.Date() - days(2)
+histMonths = 0
+# period     = "daily"
+
+periodMap = list(
+  "monthly" = 12,
+  "daily" = 252
+)
+
+concepts = list( #list of lists of code and name
+  list(
+    code      = "T5YIE", #add data code and name to this list, comment out a code and replace with "" to filter it out
+    name      = "5yr BEI",
+    source    = "FRED",
+    metric    = "none",
+    operation = "toPCT",
+    period    = "daily"
+  ),  
+  list(
+    code      = "T5YIFR", #add data code and name to this list, comment out a code and replace with "" to filter it out
+    name      = "5yr, 5yr fwd BEI",
+    source    = "FRED",
+    metric    = "none",
+    operation = "toPCT",
+    period    = "daily"
+  ),
+  list(
+    code      = "CPIAUCSL", #add data code and name to this list, comment out a code and replace with "" to filter it out
+    name      = "Inflation (y/y)",
+    source    = "FRED",
+    metric    = "yearOverYear",
+    operation = "none",
+    period    = "monthly"
+  ),
+  list(
+    code      = "EXPINF1YR", 
+    name      = "1yr Expected (Cleveland Fed)",
+    source    = "FRED",
+    metric    = "none",
+    operation = "toPCT",
+    period    = "monthly"
+  )
+)
+
+conceptsToUse = list.filter(concepts, code!= "")
+
+#-----------------------functions-----------------------------------------------
+conceptBuilder = function(singleConcept, startDate, endDate) {
+  infoList = list("startDate" = startDate,
+                  "endDate"   = endDate)
+  
+  append(singleConcept, infoList)
+}
+
+getRawData = function(source, code, startDate, endDate) { #I've removed everything except Yahoo just to shorten the code
+  #this function takes four inputs and outputs a dataframe with three columns
+  #one for date, one with the symbol, and one with the raw value
+  #there are no operations being performed at this point. the data is just loaded
+  #and then trimmed down to three columns with consistent names
+  quandl_api_key("xcRx5okJQ-cE9gq9ukTo")
+  
+  if (source == "FRED") {
+    tq_get(code, 
+           get  = "economic.data",
+           from = startDate - months(histMonths), #I always load data 12m or more earlier than start date and trim it later
+           to   = endDate) %>%            #which allows for trailing 12m calculation to yield a series starting at the selected start date
+      select(date, symbol, price) %>%
+      rename("value" = "price")
+  } else if (source == "Yahoo") {
+    tq_get(code,
+           get  = "stock.prices",
+           from = startDate - months(histMonths),
+           to   = endDate) %>%
+      select(date, symbol, adjusted) %>%
+      rename("value" = "adjusted")
+  } else if (source == "dbnomics") {
+    rdb(ids = code) %>%
+      select(period, series_name, value) %>%
+      rename("symbol" = "series_name") %>%
+      rename("date" = "period") %>%
+      filter(date >= startDate - months(histMonths) & date <= endDate)
+  } else if (source == "Quandl") {
+    tq_get(code,
+           get  = "quandl",
+           from = startDate - months(histMonths),
+           to   = endDate) %>%
+      select(date, symbol, value)
+  } else {
+    NA
+  }
+} #building block function
+
+applyMetric = function(dataFrame, metric, period, startDate, endDate) { #removing all but essential metrics too
+  # toPeriodMap = list(
+  #   monthly = "months"
+  # )
+  # toPeriodPeriodToUse = toPeriodMap[[period]]
+  nToUse = periodMap[[period]]
+  
+  if (metric == "none") {
+    dataFrame
+  } else if (metric == "growth") {
+    dataFrame %>%
+      group_by(symbol) %>%
+      tq_transmute(select = value, #values
+                   mutate_fun = periodReturn,
+                   period = period, # returns
+                   col_rename = "growth") %>%
+      ungroup() %>%
+      drop_na() %>%
+      select(date, symbol, growth) %>%
+      rename("value" = "growth")
+  } else if (metric == "yearOverYear") {
+    dataFrame %>%
+      group_by(symbol) %>%
+      mutate(value = value / lag(value, n = nToUse) - 1) %>%
+      select(date, symbol, value) %>%
+      mutate(value = round(value, 4))
+  }
+}#building block function
+
+getAndProcessData = function(concept) {
+  code      = concept$code
+  name      = concept$name
+  source    = concept$source
+  metric    = concept$metric
+  period    = concept$period
+  operation = as.character(concept$operation)
+  startDate = as.Date(concept$startDate)
+  endDate   = as.Date(concept$endDate)
+  
+  rawData = getRawData(source, code, startDate, endDate) %>%
+    mutate(symbol = name) %>% #renames the data
+    drop_na()
+  
+  operatedData = if (operation == "none") {
+    rawData
+  } else if (operation == "toPCT") {
+    rawData %>%
+      mutate(value = value * .01)
+  } else {
+    rawData
+  }
+  
+  processedData = applyMetric(operatedData, metric, period, startDate, endDate)
+  
+  trimmedData = processedData %>%
+    filter(date >= startDate & date <= endDate) 
+  
+  dateModification = if (period %in% c("monthly", "quarterly", "yearly")) {
+    trimmedData %>%
+      mutate(date = floor_date(date, "month"))
+  } else
+    trimmedData
+  
+  outputList = list("rawData" = operatedData, "processedData" = dateModification)
+  
+  append(concept, outputList)
+} #combines getRaw and applyMetric and applies to a single concept ie list of code, source etc
+
+extractElementFromList = function(list, nameOfElement) {
+  map(list, function(x) x[[nameOfElement]]) %>%
+    rbindlist() %>%
+    setorder(date)
+}
+
+tsCumulativeLNReturns = function(data) {
+  data %>%
+    group_by(symbol) %>%
+    mutate(value = log(1 + value),
+           value = cumsum(value),
+           value = round(value, 2))
+}
+tsHistReturnsStat = function(returns, period) {
+  periodMap = list(
+    daily     = 261,
+    weekly    = 52,
+    monthly   = 12,
+    quarterly = 4
+  )
+  
+  nToUse = if (period %in% names(periodMap)) {
+    periodMap[[period]]
+  } else {
+    NULL
+  } 
+  
+  
+  if (difftime(max(returns$date), min(returns$date), units = "weeks") <= 52) {
+    returns %>%
+      group_by(symbol) %>%
+      mutate(value = cumprod(1+value)-1) %>%
+      slice_tail()
+  } else {
+    returns %>%
+      group_by(symbol) %>%
+      mutate(value = cumprod(1+value)^(nToUse/length(value))-1) %>%
+      slice_tail()
+  }
+  
+}   #building block function
+tsHistVolStat = function(returns, period) {
+  periodMap = list(
+    daily     = 261,
+    weekly    = 52,
+    monthly   = 12,
+    quarterly = 4
+  )
+  
+  nToUse = if (period %in% names(periodMap)) {
+    periodMap[[period]]
+  } else {
+    NULL
+  }
+  
+  returns %>%
+    group_by(symbol) %>%
+    mutate(value = sd(value)*sqrt(nToUse)) %>%
+    slice_tail()
+  
+}  
+#viz functions
+graphDataSingleGraph = function(data) {
+  #params
+  # minDate = min(data$date)
+  # maxDate = max(data$date)
+  xLab = ""
+  yLab = ""
+  title = ""#as.character(str_glue("Data From {minDate} to {maxDate}"))
+  #helper functions
+  data$date = as.Date(data$date)
+  
+  #graph
+  data %>%
+    ggplot(aes(x = date, y = value, color = symbol)) +
+    geom_line() +
+    labs(x = xLab, y = yLab, color = "") +
+    scale_y_continuous() +
+    ggtitle(title) +
+    theme_tq() +
+    theme(legend.position = 'low') +
+    scale_color_tq(theme = "light")
+}
+
+
+#outputs ggplotly graph
+ggplotlyClean = function(graph) { #just for formatting the plotly output
+  ggplotly( graph, dynamicTicks = TRUE ) %>%
+    layout(legend = list(orientation = 'h',
+                         xanchor = "center",
+                         x = 0.5)
+    ) %>%
+    layout(title = list( xanchor = "center",
+                         x = 0.5)
+    ) 
+}
+
+
+
+```
+
+```{r BaseInputs, echo=FALSE, warning=FALSE}
+#extract data from processedData output
+shiny::inputPanel(
+  dateInput("endDate", label = "Expectations date:")
+)
+
+```
+
+```{r LoadData, echo=FALSE, warning=FALSE}
+#-----------------------load data-----------------------------------------------
+loadedConceptInfo = map(conceptsToUse, function(codeAndName) conceptBuilder(codeAndName, startDate, endDate))
+#map() takes a list and applies a function to each object in it
+
+dataList = map(loadedConceptInfo, function(concept) getAndProcessData(concept)) #loads the actual data
+
+#-----------------------logic---------------------------------------------------
+dataFrame = extractElementFromList(dataList, "processedData")
+
+inflation = dataFrame %>%
+  filter(symbol == "Inflation (y/y)")
+
+oneYrExpected = dataFrame %>%
+  filter(symbol == "1yr Expected (Cleveland Fed)")
+
+fiveYrBei = dataFrame %>%
+  filter(symbol == "5yr BEI")
+
+fiveYrFwdBei = dataFrame %>%
+  filter(symbol == "5yr, 5yr fwd BEI")
+
+# expectedInflation = fiveYrBei %>%
+#   mutate(date = date + months(30)) %>%
+#   tail(n = 1)
+
+# fwdExpectedInflation = fiveYrFwdBei %>%
+#   mutate(date = date + months(90)) %>%
+#   tail(n = 1)
+
+```
+
+```{r Filtering, echo=FALSE, warning=FALSE}
+filteredInflation = reactive({
+  # minDate = input$startDate
+  maxDate = input$endDate
+  
+  inflation %>%
+    filter(date <= maxDate)
+  
+})
+
+filteredExpectedInflation = reactive({
+  # minDate = input$startDate
+  maxDate = input$endDate
+  
+  fiveYrBei %>%
+    filter(date <= maxDate) %>%
+    mutate(date = date + months(30)) %>%
+    tail(n = 1)
+})
+
+filteredFwdExpectedInflation = reactive({
+  # minDate = input$startDate
+  maxDate = input$endDate
+  
+  fiveYrFwdBei %>%
+    filter(date <= maxDate) %>%
+    mutate(date = date + months(90)) %>%
+    tail(n = 1)
+})
+
+filteredOneYrExpectedInflation = reactive({
+  # minDate = input$startDate
+  maxDate = input$endDate
+  
+  oneYrExpected %>%
+    filter(date <= maxDate) %>%
+    mutate(date = date + months(6)) %>%
+    tail(n = 1)
+})
+```
+
+
+### Graph
+
+```{r InflationWithPointsGraph, echo=FALSE, warning=FALSE}
+renderPlotly({
+  basePlot = graphDataSingleGraph(inflation)
+  
+  expectationsDate = as.character(input$endDate)
+  
+  plotWithPoints = basePlot +
+    ggtitle(as.character(
+      str_glue("Inflation with Expectations as of {expectationsDate}")
+    )) +
+    geom_point(data = filteredExpectedInflation(), mapping = aes(x = date, y = value)) +
+    geom_point(data = filteredFwdExpectedInflation(), mapping = aes(x = date, y = value)) +
+    geom_point(data = filteredOneYrExpectedInflation(), mapping = aes(x = date, y = value)) +
+    geom_vline(xintercept = input$endDate, color = "darkgray")
+  
+  ggplotlyClean(plotWithPoints)
+})
+  
+```
+
+### Data
+
+```{r DataOutput, echo=FALSE, warning=FALSE}
+renderTable({
+  dataFrame %>%
+    pivot_wider(names_from = symbol, values_from = value) %>%
+    mutate(date = as.character(date))
+})
+  
+```
